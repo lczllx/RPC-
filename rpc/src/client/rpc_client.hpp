@@ -1,0 +1,386 @@
+#pragma once
+#include <iostream>
+#include "requestor.hpp"
+#include "caller.hpp"
+#include "rpc_registry.hpp"
+#include "rpc_topic.hpp"
+#include <string>
+#include "../general/publicconfig.hpp"
+
+namespace lcz_rpc
+{
+    
+    namespace client
+    {
+        class ClientRegistry
+        {
+        public:
+            using ptr = std::shared_ptr<ClientRegistry>;
+            ClientRegistry(const std::string &ip, int port)
+                : _requestor(std::make_shared<Requestor>()), _provider(std::make_shared<Provider>(_requestor)), _dispacher(std::make_shared<Dispacher>())
+            {
+                auto resp_cb = std::bind(&client::Requestor::onResponse, _requestor.get(), std::placeholders::_1, std::placeholders::_2);
+
+                auto msg_cb = std::bind(&Dispacher::onMessage, _dispacher.get(), std::placeholders::_1, std::placeholders::_2);
+                _dispacher->registerhandler<BaseMessage>(lcz_rpc::MsgType::RSP_RPC, resp_cb);
+                _dispacher->registerhandler<BaseMessage>(lcz_rpc::MsgType::RSP_SERVICE, resp_cb);
+                //注册REQ_SERVICE消息处理回调（注册中心可能发送上线/下线通知，虽然提供者通常不需要处理，但需要注册以避免报错）
+                _dispacher->registerhandler<ServiceRequest>(lcz_rpc::MsgType::REQ_SERVICE,
+                    [](const BaseConnection::ptr& conn, ServiceRequest::ptr& msg){
+                        // 提供者不需要处理上线/下线通知，直接忽略
+                        DLOG("ClientRegistry收到REQ_SERVICE消息，忽略");
+                    });
+                _client = lcz_rpc::ClientFactory::create(ip, port);
+                _client->setMessageCallback(msg_cb);
+                _client->connect();
+            }
+            bool methodRegistry(const std::string &method, const HostInfo &host,int load)
+            {
+                auto conn = _client->connection();
+                if (conn.get() == nullptr || conn->connected() == false)
+                {
+                    ELOG("连接获取失败,无法注册服务:%s", method.c_str());
+                    return false;
+                }
+                return _provider->methodRegistry(conn, method, host, load);
+            }
+            //给外部提供上报负载的接口
+            bool reportLoad(const std::string &method, const HostInfo &host,int load)
+            {
+                auto conn = _client->connection();
+                if(conn.get() == nullptr || conn->connected() == false)
+                {
+                    ELOG("连接获取失败,无法上报负载:%s", method.c_str());
+                    return false;
+                }
+                return _provider->reportLoad(conn, method, host, load);
+            }
+            //客户端向服务端发送心跳（提供者的心跳）RpcServer::heartbeatTick调用
+            bool heartbeatProvider(const std::string &method, const HostInfo &host)
+            {
+                auto conn = _client->connection();
+                if(conn.get() == nullptr || conn->connected() == false)
+                {
+                    ELOG("连接获取失败,无法发送心跳:%s", method.c_str());
+                    return false;
+                }
+                return _provider->heartbeatProvider(conn, method, host);
+            }
+
+        private:
+            BaseClient::ptr _client;
+            Requestor::ptr _requestor;
+            client::Provider::ptr _provider;
+            Dispacher::ptr _dispacher;
+
+        };
+        class ClientDiscover
+        {
+        public:
+            using ptr = std::shared_ptr<ClientDiscover>;
+            ~ClientDiscover()
+            {
+                if (_health_loop_ptr) {
+                    _health_loop_ptr->quit();
+                }
+            }
+            ClientDiscover(const std::string &ip, int port,const Discover::OfflineCallback &cb)
+                : _requestor(std::make_shared<Requestor>()), _discover(std::make_shared<Discover>(_requestor, cb)), _dispacher(std::make_shared<Dispacher>())
+            {
+                auto resp_cb = std::bind(&client::Requestor::onResponse, _requestor.get(), std::placeholders::_1, std::placeholders::_2);
+                auto req_cb = std::bind(&client::Discover::onserviceRequest, _discover.get(), std::placeholders::_1, std::placeholders::_2);
+                auto msg_cb = std::bind(&Dispacher::onMessage, _dispacher.get(), std::placeholders::_1, std::placeholders::_2);
+                _dispacher->registerhandler<BaseMessage>(lcz_rpc::MsgType::RSP_RPC, resp_cb);
+                _dispacher->registerhandler<BaseMessage>(lcz_rpc::MsgType::RSP_SERVICE, resp_cb);
+                _dispacher->registerhandler<ServiceRequest>(lcz_rpc::MsgType::REQ_SERVICE, req_cb);
+                _client = lcz_rpc::ClientFactory::create(ip, port);
+                _client->setMessageCallback(msg_cb);
+                _client->connect();
+                // 启动健康检查线程，定期刷新已发现服务
+                _health_loop_ptr = _health_loop.startLoop();
+                _health_loop_ptr->runEvery(_hb_config.heartbeat_interval_sec, [this]{
+                    std::vector<std::string> methods;
+                    {
+                        std::unique_lock<std::mutex> lock(_tracked_mutex);
+                        methods.assign(_tracked_methods.begin(), _tracked_methods.end());
+                    }
+                    if (methods.empty()) return;
+
+                    auto conn = _client->connection();
+                    if (!conn || !conn->connected()) {
+                        WLOG("[ClientDiscover-健康检查] 连接断开，暂不刷新");
+                        return;
+                    }
+
+                    for (const auto& method : methods) {
+                        HostDetail detail;
+                        if (_discover->serviceDiscover(conn, method, detail, LoadBalanceStrategy::ROUND_ROBIN, true)) {
+                            DLOG("[ClientDiscover-健康检查] method=%s 刷新成功 host=%s:%d load=%d",
+                                 method.c_str(), detail.host.first.c_str(), detail.host.second, detail.load);
+                        } else {
+                            WLOG("[ClientDiscover-健康检查] method=%s 刷新失败，等待下次调用重新发现", method.c_str());
+                        }
+                    }
+                });
+            }
+
+            bool serviceDiscover(const std::string &method, HostDetail &detail_bylast/*上一个serviceDiscover传入的detail*/,LoadBalanceStrategy strategy) {
+                HostDetail detail;
+                auto conn = _client->connection();
+                if(conn.get() == nullptr || conn->connected() == false)
+                {
+                    ELOG("连接获取失败,无法发现服务:%s", method.c_str());
+                    return false;
+                }
+                if (_discover->serviceDiscover(conn, method, detail,strategy)) {
+                    detail_bylast = detail;
+                    {
+                        std::unique_lock<std::mutex> lock(_tracked_mutex);
+                        _tracked_methods.insert(method);
+                    }
+                    // 可以把 detail.load 缓存起来
+                    return true;
+                }
+                return false;  // 别忘记有返回
+            }
+            bool serviceDiscover(const std::string &method, HostInfo &host,LoadBalanceStrategy strategy) {
+                HostDetail detail;
+                auto conn = _client->connection();
+                if(conn.get() == nullptr || conn->connected() == false)
+                {
+                    ELOG("连接获取失败,无法发现服务:%s", method.c_str());
+                    return false;
+                }
+                if (_discover->serviceDiscover(conn, method, detail,strategy)) {
+                    host = detail.host;
+                    {
+                        std::unique_lock<std::mutex> lock(_tracked_mutex);
+                        _tracked_methods.insert(method);
+                    }
+                    return true;
+                }
+                return false;  // 别忘记有返回
+            }
+        private:
+            BaseClient::ptr _client;
+            Requestor::ptr _requestor;
+            Discover::ptr _discover;
+            Dispacher::ptr _dispacher;
+            std::unordered_set<std::string> _tracked_methods;// 已经发现的 method 集合
+            std::mutex _tracked_mutex;//方法集合互斥锁
+
+            HeartbeatConfig _hb_config;//健康检查配置
+            muduo::net::EventLoopThread _health_loop;//健康检查线程
+            muduo::net::EventLoop* _health_loop_ptr = nullptr;//健康检查线程指针
+        };
+
+        class RpcClient
+        {
+        public:
+            using ptr = std::shared_ptr<RpcClient>;
+            ~RpcClient() = default;
+            // enablediscover 是否开启服务发现
+            RpcClient(bool enablediscover, const std::string &ip, int port)
+                : _enablediscover(enablediscover),
+                  _requestor(std::make_shared<Requestor>()),
+                  _caller(std::make_shared<RpcCaller>(_requestor)),
+                  _dispacher(std::make_shared<Dispacher>()),
+                  _loadbalance_strategy(LoadBalanceStrategy::ROUND_ROBIN)
+            {
+                auto resp_cb = std::bind(&client::Requestor::onResponse, _requestor.get(), std::placeholders::_1, std::placeholders::_2);
+                _dispacher->registerhandler<BaseMessage>(lcz_rpc::MsgType::RSP_RPC, resp_cb); // 设置resp回调响应处理
+                   
+                if (_enablediscover)
+                {
+                    auto offlinecb = std::bind(&RpcClient::delClient, this, std::placeholders::_1);
+                    _discover_client = std::make_shared<ClientDiscover>(ip, port, offlinecb); // 设置服务下线删除长连接
+                }
+                else
+                {
+                    auto msg_cb = std::bind(&Dispacher::onMessage, _dispacher.get(), std::placeholders::_1, std::placeholders::_2);
+                    _rpc_client = lcz_rpc::ClientFactory::create(ip, port);
+                    _rpc_client->setMessageCallback(msg_cb);
+                    _rpc_client->connect();
+                }
+
+            }
+            void setloadbalanceStrategy(LoadBalanceStrategy strategy)
+            {
+                _loadbalance_strategy = strategy;
+            }
+            bool call(const std::string &method_name, const Json::Value &params, Json::Value &result)
+            {
+                BaseClient::ptr client = getClient(method_name);
+                if (client.get() == nullptr)
+                {
+                    ELOG("服务获取失败：%s", method_name.c_str());
+                    return false;
+                }
+                return _caller->call(client->connection(), method_name, params, result);
+            }
+            bool call(const std::string &method_name, Json::Value &params, RpcCaller::RpcAsyncRespose &result)
+            {
+                BaseClient::ptr client = getClient(method_name);
+                if (client.get() == nullptr)
+                {
+                    ELOG("服务获取失败：%s", method_name.c_str());
+                    return false;
+                }
+                return _caller->call(client->connection(), method_name, params, result);
+            }
+            bool call(const std::string &method_name, Json::Value &params, const RpcCaller::ResponseCallback &cb)
+            {
+                BaseClient::ptr client = getClient(method_name);
+                if (client.get() == nullptr)
+                {
+                    ELOG("服务获取失败：%s", method_name.c_str());
+                    return false;
+                }
+                return _caller->call(client->connection(), method_name, params, cb);
+            }
+
+        private:
+            void delClient(const HostInfo &host)
+            {
+                std::unique_lock<std::mutex> lock(_mutex);
+                _rpc_clients.erase(host);
+            }
+            BaseClient::ptr newClient(const HostInfo &host)
+            {
+                BaseClient::ptr client;
+                auto msg_cb = std::bind(&Dispacher::onMessage, _dispacher.get(), std::placeholders::_1, std::placeholders::_2);
+                client = lcz_rpc::ClientFactory::create(host.first, host.second);
+                client->setMessageCallback(msg_cb);
+                // client->setConnectionCallback(onConnection);
+                client->connect();
+                putClient(host, client);
+                return client;
+            }
+            BaseClient::ptr getClient(const std::string &method)
+            {
+                BaseClient::ptr client;
+                if (_enablediscover)
+                {
+                    HostDetail detail;
+                    // 先通过服务发现获取提供者的地址信息
+                    bool ret = _discover_client->serviceDiscover(method, detail,_loadbalance_strategy);
+                    if (!ret)
+                    {
+                        ELOG("服务发现失败");
+                        return BaseClient::ptr();
+                    }
+                    HostInfo host = detail.host;
+                    client = getClient(host);
+                    // 如果没有实例化客户端就创建一个新的
+                    if (client.get() == nullptr)
+                    {
+                        client = newClient(host);
+                    }
+                }
+                else
+                {
+                    client = _rpc_client;
+                }
+                return client;
+            }
+            BaseClient::ptr getClient(const HostInfo &host)
+            {
+                {
+                    std::unique_lock<std::mutex> lock(_mutex);
+                    auto it = _rpc_clients.find(host);
+                    if (it != _rpc_clients.end())
+                    {
+                        return it->second;
+                    }
+                }
+                return newClient(host);
+            }
+            void putClient(const HostInfo &host, BaseClient::ptr &client)
+            {
+                std::unique_lock<std::mutex> lock(_mutex);
+                _rpc_clients[host] = client;
+            }
+
+        private:
+            struct HostHash
+            {
+                size_t operator()(const HostInfo &host)const
+                {
+                    std::string all = host.first + std::to_string(host.second);
+                    return std::hash<std::string>{}(all);
+                }
+            };
+            std::mutex _mutex;
+            bool _enablediscover;
+            BaseClient::ptr _rpc_client;
+            std::unordered_map<HostInfo, BaseClient::ptr, HostHash> _rpc_clients; // 连接池 -长连接,收到服务下线通知后通过回调删除
+            Requestor::ptr _requestor;
+            ClientDiscover::ptr _discover_client; // 服务发现客户端
+            RpcCaller::ptr _caller;
+            Dispacher::ptr _dispacher;
+            LoadBalanceStrategy _loadbalance_strategy;//负载均衡策略
+        };
+        // 轻量级主题客户端：复用 Requestor 发送 TopicRequest，并对推送消息进行分发
+        class TopicClient
+        {
+            public:
+            using ptr=std::shared_ptr<TopicClient>;
+            ~TopicClient() = default;
+            TopicClient(const std::string &ip, int port)
+            :_requestor(std::make_shared<lcz_rpc::client::Requestor>()),_topicmanager(std::make_shared<TopicManager>(_requestor)),_dispacher(std::make_shared<Dispacher>()){
+                //1.对发送请求后接收的响应的处理2.对消息推送请求进行处理3.将dispcher对应的messagecallback设置到rpc_client里面的msgcb
+                auto topic_resp=std::bind(&Requestor::onResponse,_requestor.get(),std::placeholders::_1,std::placeholders::_2);
+                _dispacher->registerhandler<BaseMessage>(MsgType::RSP_TOPIC,topic_resp);
+                auto topicpub_cb=std::bind(&TopicManager::onTopicPublish,_topicmanager.get(),std::placeholders::_1,std::placeholders::_2);
+                _dispacher->registerhandler<TopicRequest>(MsgType::REQ_TOPIC,topicpub_cb);
+                  
+                auto message_cb=std::bind(&Dispacher::onMessage,_dispacher.get(),std::placeholders::_1,std::placeholders::_2);                
+                _topic_client=lcz_rpc::ClientFactory::create(ip,port);
+                _topic_client->setMessageCallback(message_cb);
+                _topic_client->connect();
+            }
+            // 下面几个封装函数都直接复用 TopicManager，同步等待服务端确认
+            bool createTopic(const std::string &topic_name) {return _topicmanager->createTopic(_topic_client->connection(),topic_name);}
+            bool removeTopic( const std::string &topic_name) {return _topicmanager->removeTopic(_topic_client->connection(),topic_name);}
+            bool subscribeTopic(const std::string &topic_name,
+                                const TopicManager::SubCallback &cb,
+                                int priority = 0,
+                                const std::vector<std::string> &tags = {})
+            {
+                return _topicmanager->subscribeTopic(_topic_client->connection(),
+                                                     topic_name,
+                                                     cb,
+                                                     priority,
+                                                     tags);
+            }
+            bool cancelTopic( const std::string &topic_name){return _topicmanager->cancelTopic(_topic_client->connection(),topic_name);}
+            bool publishTopic(const std::string &topic_name,
+                              const std::string &msg,
+                              TopicForwardStrategy strategy = TopicForwardStrategy::BROADCAST,
+                              int fanoutLimit = 0,
+                              const std::string &shardKey = "",
+                              int priority = 0,
+                              const std::vector<std::string> &tags = {},
+                              int redundantCount = 0)
+            {
+                return _topicmanager->publishTopic(_topic_client->connection(),
+                                                   topic_name,
+                                                   msg,
+                                                   strategy,
+                                                   fanoutLimit,
+                                                   shardKey,
+                                                   priority,
+                                                   tags,
+                                                   redundantCount);
+            }
+            void shutdown(){_topic_client->shutdown();}
+            private:
+            Requestor::ptr _requestor;
+            client::TopicManager::ptr _topicmanager;
+            Dispacher::ptr _dispacher;
+            BaseClient::ptr _topic_client;
+
+            //TopicClient 仅保留必要的 RPC 功能
+        };
+    }
+} // namespace lcz_rpc
