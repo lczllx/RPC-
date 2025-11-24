@@ -120,7 +120,7 @@ int main()
     // std::cout << static_cast<int>(topicresponse2->rcode()) << std::endl;
     // std::cout << topicresponse2->result().asInt() << std::endl;
 
-    lcz_rpc::ServiceResponse::ptr serviceresponse = lcz_rpc::MessageFactory::createMessage<lcz_rpc::ServiceResponse>();
+    lcz_rpc::ServiceResponse::ptr serviceresponse = lcz_rpc::MessageFactory::create<lcz_rpc::ServiceResponse>();
     serviceresponse->setRcode(lcz_rpc::RespCode::SUCCESS);
     serviceresponse->setMethod("add");
     serviceresponse->setOptype(lcz_rpc::ServiceOpType::DISCOVER);
@@ -131,7 +131,7 @@ int main()
     std::string serialized = serviceresponse->serialize();
     std::cout << serialized << std::endl;
 
-    lcz_rpc::BaseMessage::ptr message = lcz_rpc::MessageFactory::createMessage(lcz_rpc::MsgType::RSP_SERVICE);
+    lcz_rpc::BaseMessage::ptr message = lcz_rpc::MessageFactory::create(lcz_rpc::MsgType::RSP_SERVICE);
     bool ret = message->unserialize(serialized);
     if(!ret)
     {
